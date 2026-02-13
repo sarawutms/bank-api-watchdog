@@ -1,0 +1,20 @@
+# 1. ความลับ (สำคัญที่สุด!)
+.env
+
+# 2. โฟลเดอร์ Environment
+venv/
+env/
+
+# 3. ไฟล์ขยะ Python
+__pycache__/
+*.pyc
+
+# 4. ไฟล์ Log และ Backup
+*.log
+*.bak
+good.bot.py.bak
+old_bot.py.bak
+
+# 5. ไฟล์ Test (ถ้าไม่อยากเอาขึ้น)
+# test.py
+# test_api.py
