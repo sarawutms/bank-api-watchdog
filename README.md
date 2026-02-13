@@ -55,7 +55,7 @@ For a simple background deployment on a Linux server (Ubuntu/Debian):
    ```bash
    nohup python main.py > bot.log 2>&1 &
 
-## 🔍 Monitoring & Management
+### 🔍 Monitoring & Management
 Once the bot is running in the background, you can use these essential Linux commands to monitor its status:
 
 1. **Check if the bot is running:**
