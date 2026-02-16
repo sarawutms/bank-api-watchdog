@@ -3,21 +3,24 @@ import asyncio
 import discord
 import aiohttp
 import logging
-from discord import ui
 from discord import app_commands, ui
 from discord.ext import tasks
 from dotenv import load_dotenv
 from datetime import datetime, time, timezone, timedelta
 from typing import Dict, Any, Optional
 
-# ตั้งค่า Logging
+# ==================================================
+# 0. LOGGING SETUP
+# ==================================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Configuration
+# ==================================================
+# 1. CONFIGURATION
+# ==================================================
 load_dotenv()
 
 class Config:
@@ -35,7 +38,6 @@ class Config:
     
     @classmethod
     def validate(cls):
-        """ตรวจสอบ Environment Variables ที่จำเป็น"""
         if not cls.TOKEN:
             raise ValueError("❌ DISCORD_BOT_TOKEN not found in .env")
         if cls.CHANNEL_ID == 0:
@@ -54,25 +56,22 @@ class Config:
         {"code": "030", "name": "GSB (ออมสิน)"},
     ]
 
-# Core Engine
+# ==================================================
+# 2. CORE ENGINE
+# ==================================================
 class BankEngine:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
+        self.semaphore = asyncio.Semaphore(5)
 
     def _format_time(self, raw_val: str) -> str:
-        """Format time string from various formats to HH:MM:SS"""
         try:
             if not raw_val:
                 return "--:--"
-            
-            # Handle YYYY-MM-DD HH:mm:ss format
             if " " in raw_val:
                 return raw_val.split(" ")[1][:5]
-            
-            # Handle HHmmss format (6 digits)
             if len(raw_val) == 6 and raw_val.isdigit():
                 return f"{raw_val[:2]}:{raw_val[2:4]}:{raw_val[4:6]}"
-                
             return raw_val
         except Exception as e:
             logging.warning(f"Error formatting time '{raw_val}': {e}")
@@ -84,50 +83,54 @@ class BankEngine:
             "datestart": f"{date_str} 00:00:00",
             "dateend": f"{date_str} 23:59:59",
         }
-        try:
-            async with self.session.get(Config.BASE_URL, params=params, timeout=8) as resp:
-                if resp.status != 200:
-                    return {"name": bank["name"], "error": f"HTTP {resp.status}"}
-                
-                try:
-                    data = await resp.json()
-                except Exception as e:
-                    logging.error(f"JSON decode error for {bank['name']}: {e}")
-                    return {"name": bank["name"], "error": "Invalid JSON"}
+        
+        async with self.semaphore:
+            try:
+                async with self.session.get(Config.BASE_URL, params=params, timeout=8) as resp:
+                    if resp.status != 200:
+                        return {"name": bank["name"], "error": f"HTTP {resp.status}"}
+                    
+                    try:
+                        data = await resp.json()
+                    except Exception as e:
+                        logging.error(f"JSON decode error for {bank['name']}: {e}")
+                        return {"name": bank["name"], "error": "Invalid JSON"}
 
-                rows = data.get("datareturn", [])
-                d_rows = [r for r in rows if r.get("f1") == "D"]
-                tx_count = len(d_rows)
-                
-                last_time = "--:--"
-                if tx_count > 0:
-                    last_time = self._format_time(d_rows[-1].get("f2", ""))
+                    rows = data.get("datareturn", [])
+                    d_rows = [r for r in rows if r.get("f1") == "D"]
+                    tx_count = len(d_rows)
+                    
+                    last_time = "--:--"
+                    if tx_count > 0:
+                        last_time = self._format_time(d_rows[-1].get("f2", ""))
 
-                trailer = next((r for r in rows if r.get("f1") == "T"), None)
-                amount = float(trailer.get("f7", 0)) / 100 if trailer else 0.0
-                
-                return {
-                    "name": bank["name"],
-                    "tx": tx_count,
-                    "amt": amount,
-                    "last_time": last_time,
-                    "status": "active" if tx_count > 0 else "inactive"
-                }
-        except asyncio.TimeoutError:
-            return {"name": bank["name"], "error": "Timeout"}
-        except aiohttp.ClientConnectorError:
-            logging.error(f"Cannot connect to {Config.BASE_URL}")
-            return {"name": bank["name"], "error": "Connect Fail"}
-        except Exception as e:
-            logging.error(f"Error fetching {bank['name']}: {e}")
-            return {"name": bank["name"], "error": "Error"}
+                    trailer = next((r for r in rows if r.get("f1") == "T"), None)
+                    amount = float(trailer.get("f7", 0)) / 100 if trailer else 0.0
+                    
+                    return {
+                        "name": bank["name"],
+                        "tx": tx_count,
+                        "amt": amount,
+                        "last_time": last_time,
+                        "status": "active" if tx_count > 0 else "inactive"
+                    }
+            except asyncio.TimeoutError:
+                return {"name": bank["name"], "error": "Timeout"}
+            except aiohttp.ClientConnectorError:
+                logging.error(f"Cannot connect to {Config.BASE_URL}")
+                return {"name": bank["name"], "error": "Connect Fail"}
+            except Exception as e:
+                logging.error(f"Error fetching {bank['name']}: {e}")
+                return {"name": bank["name"], "error": "Error"}
 
     async def get_summary_report(self, date_str: str):
         tasks_list = [self.fetch_single_bank(bank, date_str) for bank in Config.BANKS]
         results = await asyncio.gather(*tasks_list)
         return results
 
-# UI Dashboard
+# ==================================================
+# 3. UI DASHBOARD
+# ==================================================
 class BankDashboardView(ui.View):
     def __init__(self, bot: 'BankBot'):
         super().__init__(timeout=None)
@@ -190,15 +193,22 @@ class BankDashboardView(ui.View):
 
     async def _process_report(self, interaction: discord.Interaction, date_str: str):
         try:
-            await interaction.response.defer()
+            # 1. ตอบสนองทันทีด้วยข้อความใหม่เพื่อป้องกัน 404
+            await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {date_str} กรุณารอสักครู่...", ephemeral=False)
+            
+            # 2. เริ่มดึงข้อมูล
             embed = await self._create_embed(date_str)
-            embed.set_footer(text=f"Check by {interaction.user.display_name}")
-            await interaction.followup.send(embed=embed)
+            embed.set_footer(text=f"Checked by {interaction.user.display_name}")
+            
+            # 3. เอา Report ไปทับข้อความชั่วคราว
+            await interaction.edit_original_response(content=None, embed=embed)
+            
+            # 4. สร้างแผงควบคุมใหม่ไว้ด้านล่างสุด
             await self.bot.refresh_dashboard(interaction.channel)
         except Exception as e:
             logging.error(f"Error processing report: {e}")
             try:
-                await interaction.followup.send("❌ เกิดข้อผิดพลาดในการดึงข้อมูล", ephemeral=True)
+                await interaction.edit_original_response(content="❌ เกิดข้อผิดพลาดในการดึงข้อมูล (API ปลายทางอาจไม่ตอบสนอง)", embed=None)
             except:
                 pass
 
@@ -234,23 +244,30 @@ class DateInputModal(ui.Modal, title="ระบุวันที่"):
             val = self.date_input.value
             datetime.strptime(val, "%Y-%m-%d")
             
-            await interaction.response.defer()
+            # 1. ตอบสนองทันทีด้วยข้อความใหม่เพื่อป้องกัน 404
+            await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {val} กรุณารอสักครู่...", ephemeral=False)
+            
             view = BankDashboardView(self.bot)
             embed = await view._create_embed(val)
-            embed.set_footer(text=f"Check by {interaction.user.display_name}")
+            embed.set_footer(text=f"Checked by {interaction.user.display_name}")
             
-            await interaction.followup.send(embed=embed)
+            # 2. เอา Report ไปทับข้อความชั่วคราว
+            await interaction.edit_original_response(content=None, embed=embed)
+            
+            # 3. สร้างแผงควบคุมใหม่
             await self.bot.refresh_dashboard(interaction.channel)
         except ValueError:
             await interaction.response.send_message("❌ วันที่ผิดรูปแบบ (YYYY-MM-DD)", ephemeral=True)
         except Exception as e:
             logging.error(f"Error in date modal submission: {e}")
             try:
-                await interaction.response.send_message("❌ เกิดข้อผิดพลาดในการประมวลผล", ephemeral=True)
+                await interaction.edit_original_response(content="❌ เกิดข้อผิดพลาดในการประมวลผล", embed=None)
             except:
                 pass
 
-# Bot Main
+# ==================================================
+# 4. BOT MAIN
+# ==================================================
 class BankBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -262,7 +279,9 @@ class BankBot(discord.Client):
         self.dashboard_msg_id: Optional[int] = None
 
     async def setup_hook(self):
-        self.session = aiohttp.ClientSession()
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        self.session = aiohttp.ClientSession(connector=connector)
+        
         self.engine = BankEngine(self.session)
         self.add_view(BankDashboardView(self))
         self.daily_task.start()
@@ -322,7 +341,9 @@ class BankBot(discord.Client):
             await self.session.close()
         await super().close()
 
-# Main
+# ==================================================
+# 5. RUN
+# ==================================================
 if __name__ == "__main__":
     try:
         Config.validate()
