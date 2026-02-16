@@ -4,6 +4,7 @@ import discord
 import aiohttp
 import logging
 from discord import ui
+from discord import app_commands, ui
 from discord.ext import tasks
 from dotenv import load_dotenv
 from datetime import datetime, time, timezone, timedelta
