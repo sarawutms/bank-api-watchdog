@@ -17,6 +17,8 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+# หรี่เสียง Log ของ discord ทั้งตระกูล (ตัดปัญหา PyNaCl และ Log ซ้ำซ้อนทิ้ง 100%)
+logging.getLogger('discord').setLevel(logging.ERROR)
 
 # ==================================================
 # 1. CONFIGURATION
@@ -62,6 +64,7 @@ class Config:
 class BankEngine:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
+        # คุมคิวจำกัดการยิง API ป้องกันปัญหาคอขวดและ Timeout
         self.semaphore = asyncio.Semaphore(5)
 
     def _format_time(self, raw_val: str) -> str:
@@ -86,6 +89,7 @@ class BankEngine:
         
         async with self.semaphore:
             try:
+                # ปรับ Timeout ให้กระชับ ไม่หน่วงระบบ
                 async with self.session.get(Config.BASE_URL, params=params, timeout=8) as resp:
                     if resp.status != 200:
                         return {"name": bank["name"], "error": f"HTTP {resp.status}"}
@@ -193,17 +197,16 @@ class BankDashboardView(ui.View):
 
     async def _process_report(self, interaction: discord.Interaction, date_str: str):
         try:
-            # 1. ตอบสนองทันทีด้วยข้อความใหม่เพื่อป้องกัน 404
+            # ตอบสนองทันทีเพื่อล็อค Message ป้องกัน Error 404
             await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {date_str} กรุณารอสักครู่...", ephemeral=False)
             
-            # 2. เริ่มดึงข้อมูล
             embed = await self._create_embed(date_str)
             embed.set_footer(text=f"Checked by {interaction.user.display_name}")
             
-            # 3. เอา Report ไปทับข้อความชั่วคราว
+            # ทับข้อความเดิมด้วยตารางที่เสร็จแล้ว
             await interaction.edit_original_response(content=None, embed=embed)
             
-            # 4. สร้างแผงควบคุมใหม่ไว้ด้านล่างสุด
+            # รีเฟรชแผงควบคุมใหม่ไว้ด้านล่างสุด
             await self.bot.refresh_dashboard(interaction.channel)
         except Exception as e:
             logging.error(f"Error processing report: {e}")
@@ -244,17 +247,13 @@ class DateInputModal(ui.Modal, title="ระบุวันที่"):
             val = self.date_input.value
             datetime.strptime(val, "%Y-%m-%d")
             
-            # 1. ตอบสนองทันทีด้วยข้อความใหม่เพื่อป้องกัน 404
             await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {val} กรุณารอสักครู่...", ephemeral=False)
             
             view = BankDashboardView(self.bot)
             embed = await view._create_embed(val)
             embed.set_footer(text=f"Checked by {interaction.user.display_name}")
             
-            # 2. เอา Report ไปทับข้อความชั่วคราว
             await interaction.edit_original_response(content=None, embed=embed)
-            
-            # 3. สร้างแผงควบคุมใหม่
             await self.bot.refresh_dashboard(interaction.channel)
         except ValueError:
             await interaction.response.send_message("❌ วันที่ผิดรูปแบบ (YYYY-MM-DD)", ephemeral=True)
@@ -279,6 +278,7 @@ class BankBot(discord.Client):
         self.dashboard_msg_id: Optional[int] = None
 
     async def setup_hook(self):
+        # ใช้ TCPConnector เพื่อลด Delay จากการทำ Handshake & DNS Lookup
         connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
         self.session = aiohttp.ClientSession(connector=connector)
         
@@ -286,7 +286,7 @@ class BankBot(discord.Client):
         self.add_view(BankDashboardView(self))
         self.daily_task.start()
         await self.tree.sync()
-        logging.info(f"Logged in as {self.user}")
+        logging.info(f"Logged in as {self.user.name}")
 
     async def refresh_dashboard(self, channel: discord.TextChannel):
         if self.dashboard_msg_id:
@@ -294,7 +294,7 @@ class BankBot(discord.Client):
                 msg = await channel.fetch_message(self.dashboard_msg_id)
                 await msg.delete()
             except discord.NotFound:
-                logging.debug(f"Dashboard message {self.dashboard_msg_id} not found")
+                pass # ถ้าโดนลบไปก่อนแล้ว ก็ปล่อยผ่านได้เลย
             except Exception as e:
                 logging.error(f"Error deleting dashboard message: {e}")
             
@@ -348,7 +348,8 @@ if __name__ == "__main__":
     try:
         Config.validate()
         bot = BankBot()
-        bot.run(Config.TOKEN)
+        # [แก้ตรงนี้] ใส่ log_handler=None เพื่อล็อคไม่ให้ Discord มารวน Log ของเรา
+        bot.run(Config.TOKEN, log_handler=None)
     except ValueError as e:
         logging.error(str(e))
     except Exception as e:
