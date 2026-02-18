@@ -57,33 +57,32 @@ Create a .env file in the root directory and add your credentials:
 
 ## 🚀 Deployment (Background Process)
 
-### For a simple background deployment on a Linux server (Ubuntu/Debian):
+**For a simple background deployment on a Linux server (Ubuntu/Debian):**
    ```bash
    nohup python main.py > bot.log 2>&1 &
    ```
 
-## 🔍 Monitoring & Management
+### 🔍 Monitoring & Management
 
-### Once the bot is running in the background, you can use these essential Linux commands to monitor its status:
+**Once the bot is running in the background, you can use these essential Linux commands to monitor its status:**
 
 1. **Check if the bot is running:**
 
-### Look for main.py in the output to confirm the bot is active. You will also see its PID (Process ID).
+**Look for main.py in the output to confirm the bot is active. You will also see its PID (Process ID).**
    ```bash
    ps aux | grep python
    ```
 
 2. **View live logs:**
 
-### Streams the log file in real-time to monitor activity and catch errors. (Press Ctrl+C to exit).
+**Streams the log file in real-time to monitor activity and catch errors. (Press Ctrl+C to exit).**
    ```bash
    tail -f bot.log
    ```
 
 3. **Stop the bot:**
 
-### (Replace <PID> with the actual Process ID found in step 1).
+**(Replace <PID> with the actual Process ID found in step 1).**
    ```bash
    kill <PID>
-   ```python main.py
-   
+   ```
