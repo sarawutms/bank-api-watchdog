@@ -3,6 +3,7 @@
 
 # 2. โฟลเดอร์ Environment
 venv/
+.venv/
 env/
 
 # 3. ไฟล์ขยะ Python
@@ -12,6 +13,7 @@ __pycache__/
 # 4. ไฟล์ Log และ Backup
 *.log
 *.bak
+*.zip
 good.bot.py.bak
 old_bot.py.bak
 
