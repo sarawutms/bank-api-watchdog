@@ -7,7 +7,7 @@ from discord import app_commands, ui
 from discord.ext import tasks
 from dotenv import load_dotenv
 from datetime import datetime, time, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # ==================================================
 # 0. LOGGING SETUP
@@ -109,7 +109,14 @@ class BankEngine:
                         last_time = self._format_time(d_rows[-1].get("f2", ""))
 
                     trailer = next((r for r in rows if r.get("f1") == "T"), None)
-                    amount = float(trailer.get("f7", 0)) / 100 if trailer else 0.0
+                    amount = 0.0
+                    if trailer:
+                        try:
+                            # ป้องกัน Error หาก f7 ไม่ใช่ตัวเลข
+                            amount = float(trailer.get("f7", 0)) / 100
+                        except (ValueError, TypeError):
+                            logging.warning(f"Invalid amount format in trailer for {bank['name']}")
+                            amount = 0.0
                     
                     return {
                         "name": bank["name"],
@@ -127,7 +134,7 @@ class BankEngine:
                 logging.error(f"Error fetching {bank['name']}: {e}")
                 return {"name": bank["name"], "error": "Error"}
 
-    async def get_summary_report(self, date_str: str):
+    async def get_summary_report(self, date_str: str) -> List[Dict[str, Any]]:
         tasks_list = [self.fetch_single_bank(bank, date_str) for bank in Config.BANKS]
         results = await asyncio.gather(*tasks_list)
         return results
@@ -146,8 +153,76 @@ class BankDashboardView(ui.View):
             return False
         return True
 
-    async def _create_embed(self, date_str: str):
-        results = await self.bot.engine.get_summary_report(date_str)
+    @ui.button(label="วันนี้", emoji="☀️", style=discord.ButtonStyle.success, custom_id="btn_today")
+    async def today(self, itn: discord.Interaction, _):
+        d = datetime.now(Config.THAI_TZ).strftime("%Y-%m-%d")
+        await self.bot.process_report_interaction(itn, d)
+
+    @ui.button(label="เมื่อวาน", emoji="⏮️", style=discord.ButtonStyle.primary, custom_id="btn_yesterday")
+    async def yesterday(self, itn: discord.Interaction, _):
+        d = (datetime.now(Config.THAI_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+        await self.bot.process_report_interaction(itn, d)
+
+    @ui.button(label="ระบุวัน", emoji="📅", style=discord.ButtonStyle.secondary, custom_id="btn_custom")
+    async def custom(self, itn: discord.Interaction, _):
+        await itn.response.send_modal(DateInputModal(self.bot))
+
+    @ui.button(label="เคลียร์จอ", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="btn_clear")
+    async def clear(self, itn: discord.Interaction, _):
+        await itn.response.defer(ephemeral=True)
+        # ลบข้อความที่เก่ากว่า 14 วันไม่ได้ (Discord Limit) แต่ purge จะข้ามให้เอง
+        await itn.channel.purge(limit=50, check=lambda m: not m.pinned) 
+        await self.bot.refresh_dashboard(itn.channel)
+
+class DateInputModal(ui.Modal, title="ระบุวันที่"):
+    date_input = ui.TextInput(label="YYYY-MM-DD", placeholder="2026-02-04", min_length=10, max_length=10)
+
+    def __init__(self, bot: 'BankBot'):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = self.date_input.value
+            # Validate format
+            datetime.strptime(val, "%Y-%m-%d")
+            await self.bot.process_report_interaction(interaction, val)
+        except ValueError:
+            await interaction.response.send_message("❌ วันที่ผิดรูปแบบ (YYYY-MM-DD)", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in date modal submission: {e}")
+            await interaction.response.send_message("❌ เกิดข้อผิดพลาดในการประมวลผล", ephemeral=True)
+
+# ==================================================
+# 4. BOT MAIN
+# ==================================================
+class BankBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True 
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.engine: Optional[BankEngine] = None
+        self.dashboard_msg_id: Optional[int] = None
+
+    async def setup_hook(self):
+        # ใช้ TCPConnector เพื่อลด Delay จากการทำ Handshake & DNS Lookup
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        self.session = aiohttp.ClientSession(connector=connector)
+        
+        self.engine = BankEngine(self.session)
+        self.add_view(BankDashboardView(self))
+        self.daily_task.start()
+        await self.tree.sync()
+        logging.info(f"Logged in as {self.user.name}")
+
+    async def create_report_embed(self, date_str: str) -> discord.Embed:
+        """Centralized logic to create report embed"""
+        if not self.engine:
+            raise RuntimeError("Engine not initialized")
+
+        results = await self.engine.get_summary_report(date_str)
         
         total_tx = sum(r.get('tx', 0) for r in results if 'tx' in r)
         total_amt = sum(r.get('amt', 0.0) for r in results if 'amt' in r)
@@ -195,98 +270,27 @@ class BankDashboardView(ui.View):
             
         return embed
 
-    async def _process_report(self, interaction: discord.Interaction, date_str: str):
+    async def process_report_interaction(self, interaction: discord.Interaction, date_str: str):
+        """Handle UI flow for report generation"""
         try:
-            # ตอบสนองทันทีเพื่อล็อค Message ป้องกัน Error 404
+            # ตอบสนองทันทีเพื่อล็อค Message ป้องกัน Error 404 (Loading State)
             await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {date_str} กรุณารอสักครู่...", ephemeral=False)
             
-            embed = await self._create_embed(date_str)
+            embed = await self.create_report_embed(date_str)
             embed.set_footer(text=f"Checked by {interaction.user.display_name}")
             
             # ทับข้อความเดิมด้วยตารางที่เสร็จแล้ว
             await interaction.edit_original_response(content=None, embed=embed)
             
-            # รีเฟรชแผงควบคุมใหม่ไว้ด้านล่างสุด
-            await self.bot.refresh_dashboard(interaction.channel)
+            # รีเฟรชแผงควบคุมใหม่ไว้ด้านล่างสุดเสมอ
+            if isinstance(interaction.channel, discord.TextChannel):
+                await self.refresh_dashboard(interaction.channel)
         except Exception as e:
             logging.error(f"Error processing report: {e}")
             try:
                 await interaction.edit_original_response(content="❌ เกิดข้อผิดพลาดในการดึงข้อมูล (API ปลายทางอาจไม่ตอบสนอง)", embed=None)
             except:
                 pass
-
-    @ui.button(label="วันนี้", emoji="☀️", style=discord.ButtonStyle.success, custom_id="btn_today")
-    async def today(self, itn, _):
-        d = datetime.now(Config.THAI_TZ).strftime("%Y-%m-%d")
-        await self._process_report(itn, d)
-
-    @ui.button(label="เมื่อวาน", emoji="⏮️", style=discord.ButtonStyle.primary, custom_id="btn_yesterday")
-    async def yesterday(self, itn, _):
-        d = (datetime.now(Config.THAI_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
-        await self._process_report(itn, d)
-
-    @ui.button(label="ระบุวัน", emoji="📅", style=discord.ButtonStyle.secondary, custom_id="btn_custom")
-    async def custom(self, itn, _):
-        await itn.response.send_modal(DateInputModal(self.bot))
-
-    @ui.button(label="เคลียร์จอ", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="btn_clear")
-    async def clear(self, itn, _):
-        await itn.response.defer(ephemeral=True)
-        await itn.channel.purge(limit=50, check=lambda m: not m.pinned) 
-        await self.bot.refresh_dashboard(itn.channel)
-
-class DateInputModal(ui.Modal, title="ระบุวันที่"):
-    date_input = ui.TextInput(label="YYYY-MM-DD", placeholder="2026-02-04", min_length=10, max_length=10)
-
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = self.date_input.value
-            datetime.strptime(val, "%Y-%m-%d")
-            
-            await interaction.response.send_message(f"⏳ กำลังดึงข้อมูล API ของวันที่ {val} กรุณารอสักครู่...", ephemeral=False)
-            
-            view = BankDashboardView(self.bot)
-            embed = await view._create_embed(val)
-            embed.set_footer(text=f"Checked by {interaction.user.display_name}")
-            
-            await interaction.edit_original_response(content=None, embed=embed)
-            await self.bot.refresh_dashboard(interaction.channel)
-        except ValueError:
-            await interaction.response.send_message("❌ วันที่ผิดรูปแบบ (YYYY-MM-DD)", ephemeral=True)
-        except Exception as e:
-            logging.error(f"Error in date modal submission: {e}")
-            try:
-                await interaction.edit_original_response(content="❌ เกิดข้อผิดพลาดในการประมวลผล", embed=None)
-            except:
-                pass
-
-# ==================================================
-# 4. BOT MAIN
-# ==================================================
-class BankBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True 
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.engine: Optional[BankEngine] = None
-        self.dashboard_msg_id: Optional[int] = None
-
-    async def setup_hook(self):
-        # ใช้ TCPConnector เพื่อลด Delay จากการทำ Handshake & DNS Lookup
-        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-        self.session = aiohttp.ClientSession(connector=connector)
-        
-        self.engine = BankEngine(self.session)
-        self.add_view(BankDashboardView(self))
-        self.daily_task.start()
-        await self.tree.sync()
-        logging.info(f"Logged in as {self.user.name}")
 
     async def refresh_dashboard(self, channel: discord.TextChannel):
         if self.dashboard_msg_id:
@@ -309,26 +313,38 @@ class BankBot(discord.Client):
     @tasks.loop(time=time(hour=7, minute=30, tzinfo=Config.THAI_TZ))
     async def daily_task(self):
         try:
-            channel = self.get_channel(Config.CHANNEL_ID)
+            # Use fetch_channel for better reliability
+            try:
+                channel = await self.fetch_channel(Config.CHANNEL_ID)
+            except discord.NotFound:
+                logging.error(f"Channel {Config.CHANNEL_ID} not found (NotFound Error)")
+                return
+            except discord.Forbidden:
+                logging.error(f"Bot missing permissions to access channel {Config.CHANNEL_ID}")
+                return
+            except Exception as e:
+                logging.error(f"Error fetching channel: {e}")
+                channel = self.get_channel(Config.CHANNEL_ID) # Fallback to cache
+
             if not channel:
-                logging.warning(f"Channel {Config.CHANNEL_ID} not found for daily task")
+                logging.warning(f"Channel {Config.CHANNEL_ID} could not be retrieved")
                 return
 
-            try:
-                await channel.purge(limit=20, check=lambda m: not m.pinned)
-            except Exception as e:
-                logging.error(f"Error purging channel: {e}")
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.purge(limit=20, check=lambda m: not m.pinned)
+                except Exception as e:
+                    logging.error(f"Error purging channel: {e}")
             
-            today = datetime.now(Config.THAI_TZ).strftime("%Y-%m-%d")
-            logging.info(f"Running daily task for {today}")
-            
-            view = BankDashboardView(self)
-            embed = await view._create_embed(today)
-            embed.title = f"📢 รายงาน API อัตโนมัติ: ({today})"
-            
-            await channel.send(embed=embed)
-            await self.refresh_dashboard(channel)
-            logging.info("Daily task completed successfully")
+                today = datetime.now(Config.THAI_TZ).strftime("%Y-%m-%d")
+                logging.info(f"Running daily task for {today}")
+                
+                embed = await self.create_report_embed(today)
+                embed.title = f"📢 รายงาน API อัตโนมัติ: ({today})"
+                
+                await channel.send(embed=embed)
+                await self.refresh_dashboard(channel)
+                logging.info("Daily task completed successfully")
         except Exception as e:
             logging.error(f"Error in daily_task: {e}")
 
