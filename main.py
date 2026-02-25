@@ -310,7 +310,10 @@ class BankBot(discord.Client):
         msg = await channel.send(embed=embed, view=BankDashboardView(self))
         self.dashboard_msg_id = msg.id
 
-    @tasks.loop(time=time(hour=7, minute=30, tzinfo=Config.THAI_TZ))
+    @tasks.loop(time=[
+        time(hour=7, minute=30, tzinfo=Config.THAI_TZ),
+        time(hour=11, minute=0, tzinfo=Config.THAI_TZ),
+    ])
     async def daily_task(self):
         try:
             # Use fetch_channel for better reliability
