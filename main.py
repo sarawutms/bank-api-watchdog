@@ -312,7 +312,7 @@ class BankBot(discord.Client):
 
     @tasks.loop(time=[
         time(hour=7, minute=30, tzinfo=Config.THAI_TZ),
-        time(hour=11, minute=0, tzinfo=Config.THAI_TZ),
+        time(hour=11, minute=15, tzinfo=Config.THAI_TZ),
     ])
     async def daily_task(self):
         try:
